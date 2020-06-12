@@ -274,13 +274,13 @@ int agent_send(juice_agent_t *agent, const char *data, size_t size) {
 		atomic_flag_clear(&selected_entry->armed); // so keepalive will be rescheduled
 #endif
 
-	if (!selected_entry || !selected_entry->pair) {
+	if (!selected_entry) {
 		JLOG_ERROR("Send called before ICE is connected");
 		pthread_mutex_unlock(&agent->mutex);
 		return -1;
 	}
 
-	const addr_record_t *record = &selected_entry->pair->remote->resolved;
+	const addr_record_t *record = &selected_entry->record;
 #if defined(_WIN32) || defined(__APPLE__)
 	addr_record_t tmp = *record;
 	addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
@@ -308,8 +308,12 @@ int agent_get_selected_candidate_pair(juice_agent_t *agent, ice_candidate_t *loc
 		pthread_mutex_unlock(&agent->mutex);
 		return -1;
 	}
-	*local = pair->local ? *pair->local : agent->local.candidates[0];
-	*remote = *pair->remote;
+
+	if (local)
+		*local = pair->local ? *pair->local : agent->local.candidates[0];
+	if (remote)
+		*remote = *pair->remote;
+
 	pthread_mutex_unlock(&agent->mutex);
 	return 0;
 }
@@ -1077,6 +1081,9 @@ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *remote) {
 	juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
 	++agent->entries_count;
 
+	if (remote->type == ICE_CANDIDATE_TYPE_HOST)
+		agent_fix_local_host_candidate_entry(agent, entry);
+
 	agent_arm_transmission(agent, entry, 0); // transmit now
 	return 0;
 }
@@ -1157,8 +1164,9 @@ agent_stun_entry_t *agent_find_entry_from_record(juice_agent_t *agent,
 #endif
 	if (selected_entry) {
 		// As an optimization, try to match selected entry first
-		if (record->len == selected_entry->record.len &&
-		    memcmp(&record->addr, &selected_entry->record.addr, record->len) == 0) {
+		addr_record_t *r = selected_entry->pair ? &selected_entry->pair->remote->resolved
+		                                        : &selected_entry->record;
+		if (addr_is_equal((struct sockaddr *)&r->addr, (struct sockaddr *)&record->addr, true)) {
 			JLOG_DEBUG("STUN selected entry matching incoming address");
 			return selected_entry;
 		}
@@ -1167,11 +1175,47 @@ agent_stun_entry_t *agent_find_entry_from_record(juice_agent_t *agent,
 		agent_stun_entry_t *entry = agent->entries + i;
 		if (entry == selected_entry)
 			continue;
-		if (record->len == entry->record.len &&
-		    memcmp(&record->addr, &entry->record.addr, record->len) == 0) {
+
+		addr_record_t *r = entry->pair ? &entry->pair->remote->resolved : &entry->record;
+		if (addr_is_equal((struct sockaddr *)&r->addr, (struct sockaddr *)&record->addr, true)) {
 			JLOG_DEBUG("STUN entry %d matching incoming address", i);
 			return entry;
 		}
 	}
 	return NULL;
+}
+
+void agent_fix_local_host_candidate_entry(juice_agent_t *agent, agent_stun_entry_t *entry) {
+	if (!entry->pair || entry->pair->remote->type != ICE_CANDIDATE_TYPE_HOST)
+		return;
+
+	for (int i = 0; i < agent->local.candidates_count; ++i) {
+		ice_candidate_t *candidate = agent->local.candidates + i;
+		if (candidate->type != ICE_CANDIDATE_TYPE_HOST)
+			continue;
+
+		if (addr_is_equal((struct sockaddr *)&candidate->resolved.addr,
+		                  (struct sockaddr *)&entry->record.addr, false)) {
+			JLOG_DEBUG("Entry remote address matches local candidate, replacing with localhost");
+			struct sockaddr_storage *addr = &entry->record.addr;
+			switch (addr->ss_family) {
+			case AF_INET6: {
+				struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+				memset(&sin6->sin6_addr, 0, 16);
+				*((uint8_t *)&sin6->sin6_addr + 15) = 0x01;
+				break;
+			}
+			case AF_INET: {
+				struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+				const uint8_t localhost[4] = {127, 0, 0, 1};
+				memcpy(&sin->sin_addr, localhost, 4);
+				break;
+			}
+			default:
+				// Ignore
+				break;
+			}
+			break;
+		}
+	}
 }
